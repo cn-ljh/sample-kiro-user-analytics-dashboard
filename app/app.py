@@ -565,6 +565,40 @@ def main():
             apply_chart_theme(fig_overage)
             st.plotly_chart(fig_overage, use_container_width=True)
 
+        # Monthly credit usage by user table
+        st.subheader("📅 Credit Usage by User by Month")
+
+        query_credits_monthly = f"""
+        SELECT
+            userid,
+            DATE_FORMAT(DATE_PARSE(date, '%Y-%m-%d'), '%Y-%m') as month,
+            SUM(TRY_CAST(credits_used AS DOUBLE)) as credits_used
+        FROM {table_name}
+        GROUP BY userid, DATE_FORMAT(DATE_PARSE(date, '%Y-%m-%d'), '%Y-%m')
+        ORDER BY month, userid
+        """
+        df_credits_monthly = fetch_data(query_credits_monthly)
+        df_credits_monthly['userid'] = df_credits_monthly['userid'].str.replace("'", "").str.replace('"', '')
+        df_credits_monthly['credits_used'] = df_credits_monthly['credits_used'].apply(safe_float)
+
+        umap_monthly = get_usernames_batch(df_credits_monthly['userid'].unique().tolist())
+        df_credits_monthly['User'] = df_credits_monthly['userid'].map(umap_monthly)
+
+        # Pivot: rows = users, columns = months
+        df_pivot = df_credits_monthly.pivot_table(
+            index='User', columns='month', values='credits_used',
+            aggfunc='sum', fill_value=0
+        )
+        # Sort columns chronologically
+        df_pivot = df_pivot[sorted(df_pivot.columns)]
+        # Add a total column
+        df_pivot['Total'] = df_pivot.sum(axis=1)
+        df_pivot = df_pivot.sort_values('Total', ascending=False)
+        # Round for display
+        df_pivot = df_pivot.round(1)
+
+        st.dataframe(df_pivot, use_container_width=True, height=400)
+
         st.markdown("---")
 
         # ── Subscription Tier Breakdown ──
