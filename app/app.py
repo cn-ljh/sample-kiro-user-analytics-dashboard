@@ -144,7 +144,12 @@ def get_username(userid):
         return userid
     try:
         client = get_identity_store_client()
-        response = client.describe_user(IdentityStoreId=IDENTITY_STORE_ID, UserId=userid)
+        # Kiro logs may include Identity Store ID prefix (e.g. "d-xxxxx.xxxxx-uuid")
+        # Strip the prefix to get the actual UserId for the API call
+        lookup_id = userid
+        if '.' in userid:
+            lookup_id = userid.split('.', 1)[1]
+        response = client.describe_user(IdentityStoreId=IDENTITY_STORE_ID, UserId=lookup_id)
         return response.get('UserName') or response.get('DisplayName') or \
                response.get('Emails', [{}])[0].get('Value') or userid
     except Exception:
@@ -156,11 +161,16 @@ def get_usernames_batch(userids):
 
 def execute_athena_query(query):
     client = get_athena_client()
-    response = client.start_query_execution(
+    workgroup = os.getenv('ATHENA_WORKGROUP', '')
+    kwargs = dict(
         QueryString=query,
         QueryExecutionContext={'Database': ATHENA_DATABASE},
-        ResultConfiguration={'OutputLocation': ATHENA_OUTPUT_BUCKET}
     )
+    if workgroup:
+        kwargs['WorkGroup'] = workgroup
+    else:
+        kwargs['ResultConfiguration'] = {'OutputLocation': ATHENA_OUTPUT_BUCKET}
+    response = client.start_query_execution(**kwargs)
     qid = response['QueryExecutionId']
     while True:
         result = client.get_query_execution(QueryExecutionId=qid)

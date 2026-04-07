@@ -1,0 +1,485 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Kiro User Analytics Dashboard - Glue/Athena + ECS Fargate + ALB + Cognito
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: kiro-user-report-dashboard
+    Description: Project name used as prefix for all resources
+  AwsAccountId:
+    Type: String
+    Description: AWS Account ID (used in S3 data path)
+  S3DataPath:
+    Type: String
+    Description: >-
+      S3 path to Kiro log data (format: bucket-name/prefix).
+      The Glue Crawler will scan s3://<S3DataPath>/AWSLogs/<AccountId>/KiroLogs/user_report/<Region>/
+  GlueDatabaseName:
+    Type: String
+    Default: kiro-user-report
+    Description: Name for the Glue database
+  GlueCrawlerSchedule:
+    Type: String
+    Default: 'cron(0 2 * * ? *)'
+    Description: Glue Crawler schedule (cron expression, UTC)
+  IdentityStoreId:
+    Type: String
+    Default: ''
+    Description: IAM Identity Center Identity Store ID (optional, for username resolution)
+  ImageUri:
+    Type: String
+    Description: ECR image URI (e.g. 123456789012.dkr.ecr.us-east-1.amazonaws.com/repo:tag)
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC ID for ALB and ECS tasks
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: At least 2 public subnets in different AZs
+  DomainName:
+    Type: String
+    Description: Domain name for the dashboard (e.g. kiro.example.com). Must have an ACM certificate.
+  CertificateArn:
+    Type: String
+    Description: ACM certificate ARN for HTTPS (must cover DomainName)
+  HostedZoneId:
+    Type: String
+    Default: ''
+    Description: Route53 hosted zone ID for DNS record (optional, create manually if not using Route53)
+
+Conditions:
+  HasHostedZone: !Not [!Equals [!Ref HostedZoneId, '']]
+
+Resources:
+  # ── S3 Bucket for Athena Results ──
+  AthenaResultsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-athena-results-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: delete-old-results
+            Status: Enabled
+            ExpirationInDays: 7
+
+  # ── Glue Database ──
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Ref GlueDatabaseName
+        Description: Database for Kiro analytics data
+
+  # ── Glue Crawler IAM Role ──
+  GlueCrawlerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-glue-crawler-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: glue-s3-access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject, s3:ListBucket]
+                Resource:
+                  - !Sub
+                    - 'arn:aws:s3:::${B}'
+                    - B: !Select [0, !Split ['/', !Ref S3DataPath]]
+                  - !Sub 'arn:aws:s3:::${S3DataPath}/AWSLogs/${AwsAccountId}/KiroLogs/user_report/${AWS::Region}/*'
+
+  # ── Glue Crawler ──
+  GlueCrawler:
+    Type: AWS::Glue::Crawler
+    DependsOn: GlueDatabase
+    Properties:
+      Name: !Sub '${ProjectName}-crawler'
+      Role: !GetAtt GlueCrawlerRole.Arn
+      DatabaseName: !Ref GlueDatabaseName
+      Targets:
+        S3Targets:
+          - Path: !Sub 's3://${S3DataPath}/AWSLogs/${AwsAccountId}/KiroLogs/user_report/${AWS::Region}/'
+      SchemaChangePolicy:
+        DeleteBehavior: LOG
+        UpdateBehavior: UPDATE_IN_DATABASE
+      Schedule:
+        ScheduleExpression: !Ref GlueCrawlerSchedule
+      Configuration: '{"Version":1.0,"CrawlerOutput":{"Partitions":{"AddOrUpdateBehavior":"InheritFromTable"}}}'
+
+  # ── Athena Workgroup ──
+  AthenaWorkgroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: !Sub '${ProjectName}-workgroup'
+      State: ENABLED
+      WorkGroupConfiguration:
+        EnforceWorkGroupConfiguration: true
+        PublishCloudWatchMetricsEnabled: true
+        ResultConfiguration:
+          OutputLocation: !Sub 's3://${AthenaResultsBucket}/'
+          EncryptionConfiguration:
+            EncryptionOption: SSE_S3
+
+  # ── ALB Security Group ──
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ALB for Kiro Dashboard
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-alb-sg'
+
+  # ── ECS Security Group ──
+  ECSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ECS tasks for Kiro Dashboard
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-ecs-sg'
+
+  # ── ALB ──
+  ALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub '${ProjectName}-alb'
+      Scheme: internet-facing
+      Type: application
+      SecurityGroups: [!Ref ALBSecurityGroup]
+      Subnets: !Ref SubnetIds
+
+  ALBTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${ProjectName}-tg'
+      Port: 8080
+      Protocol: HTTP
+      VpcId: !Ref VpcId
+      TargetType: ip
+      HealthCheckPath: /_stcore/health
+      HealthCheckIntervalSeconds: 30
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 5
+      TargetGroupAttributes:
+        - Key: stickiness.enabled
+          Value: 'true'
+        - Key: stickiness.type
+          Value: lb_cookie
+        - Key: stickiness.lb_cookie.duration_seconds
+          Value: '86400'
+
+  # ── HTTP Listener (redirect to HTTPS) ──
+  ALBListenerHTTP:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ALB
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: redirect
+          RedirectConfig:
+            Protocol: HTTPS
+            Port: '443'
+            StatusCode: HTTP_301
+
+  # ── HTTPS Listener (Cognito auth + forward) ──
+  ALBListenerHTTPS:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ALB
+      Port: 443
+      Protocol: HTTPS
+      Certificates:
+        - CertificateArn: !Ref CertificateArn
+      DefaultActions:
+        - Type: authenticate-cognito
+          Order: 1
+          AuthenticateCognitoConfig:
+            UserPoolArn: !GetAtt CognitoUserPool.Arn
+            UserPoolClientId: !Ref CognitoUserPoolClient
+            UserPoolDomain: !Ref CognitoUserPoolDomain
+            SessionCookieName: AWSELBAuthSessionCookie
+            SessionTimeout: 604800
+            Scope: openid
+            OnUnauthenticatedRequest: authenticate
+        - Type: forward
+          Order: 2
+          TargetGroupArn: !Ref ALBTargetGroup
+
+  # ── Cognito User Pool ──
+  CognitoUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub '${ProjectName}-users'
+      AutoVerifiedAttributes: [email]
+      UsernameAttributes: [email]
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+          RequireUppercase: true
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Required: true
+          Mutable: true
+
+  # ── Cognito User Pool Domain ──
+  CognitoUserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !Sub '${ProjectName}-auth'
+      UserPoolId: !Ref CognitoUserPool
+
+  # ── Cognito App Client ──
+  CognitoUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub '${ProjectName}-web-client'
+      UserPoolId: !Ref CognitoUserPool
+      GenerateSecret: true
+      AllowedOAuthFlows: [code]
+      AllowedOAuthScopes: [openid, email, profile]
+      AllowedOAuthFlowsUserPoolClient: true
+      SupportedIdentityProviders: [COGNITO]
+      CallbackURLs:
+        - !Sub 'https://${DomainName}/oauth2/idpresponse'
+      LogoutURLs:
+        - !Sub 'https://${DomainName}'
+
+  # ── Route53 DNS Record (optional) ──
+  DNSRecord:
+    Type: AWS::Route53::RecordSet
+    Condition: HasHostedZone
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref DomainName
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt ALB.DNSName
+        HostedZoneId: !GetAtt ALB.CanonicalHostedZoneID
+        EvaluateTargetHealth: true
+
+  # ── ECS Cluster ──
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub '${ProjectName}'
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+
+  # ── ECS Task Execution Role ──
+  ECSTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-ecs-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  # ── ECS Task Role (Athena/Glue/S3 access) ──
+  ECSTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-ecs-task-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: athena-glue-s3-access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: AthenaAccess
+                Effect: Allow
+                Action:
+                  - athena:StartQueryExecution
+                  - athena:GetQueryExecution
+                  - athena:GetQueryResults
+                  - athena:StopQueryExecution
+                  - athena:GetWorkGroup
+                Resource: !Sub 'arn:aws:athena:${AWS::Region}:${AWS::AccountId}:workgroup/${ProjectName}-workgroup'
+              - Sid: GlueAccess
+                Effect: Allow
+                Action:
+                  - glue:GetDatabase
+                  - glue:GetTable
+                  - glue:GetTables
+                  - glue:GetPartitions
+                Resource:
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog'
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/${GlueDatabaseName}'
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/${GlueDatabaseName}/*'
+              - Sid: S3DataAccess
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub
+                    - 'arn:aws:s3:::${B}'
+                    - B: !Select [0, !Split ['/', !Ref S3DataPath]]
+                  - !Sub 'arn:aws:s3:::${S3DataPath}/AWSLogs/${AwsAccountId}/KiroLogs/user_report/${AWS::Region}/*'
+              - Sid: AthenaResultsBucketAccess
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                  - s3:CreateBucket
+                  - s3:ListBucketMultipartUploads
+                  - s3:ListMultipartUploadParts
+                  - s3:AbortMultipartUpload
+                Resource:
+                  - !GetAtt AthenaResultsBucket.Arn
+                  - !Sub '${AthenaResultsBucket.Arn}/*'
+              - Sid: IdentityStoreAccess
+                Effect: Allow
+                Action:
+                  - identitystore:DescribeUser
+                  - identitystore:ListUsers
+                Resource: '*'
+
+  # ── CloudWatch Log Group ──
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/ecs/${ProjectName}'
+      RetentionInDays: 14
+
+  # ── ECS Task Definition ──
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${ProjectName}'
+      Cpu: '256'
+      Memory: '512'
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt ECSTaskRole.Arn
+      ContainerDefinitions:
+        - Name: dashboard
+          Image: !Ref ImageUri
+          PortMappings:
+            - ContainerPort: 8080
+              Protocol: tcp
+          Environment:
+            - Name: AWS_REGION
+              Value: !Ref AWS::Region
+            - Name: ATHENA_DATABASE
+              Value: !Ref GlueDatabaseName
+            - Name: ATHENA_OUTPUT_BUCKET
+              Value: !Sub 's3://${AthenaResultsBucket}/'
+            - Name: IDENTITY_STORE_ID
+              Value: !Ref IdentityStoreId
+            - Name: ATHENA_WORKGROUP
+              Value: !Sub '${ProjectName}-workgroup'
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+          HealthCheck:
+            Command: ['CMD-SHELL', 'curl -f http://localhost:8080/_stcore/health || exit 1']
+            Interval: 30
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 60
+
+  # ── ECS Service ──
+  ECSService:
+    Type: AWS::ECS::Service
+    DependsOn: ALBListenerHTTPS
+    Properties:
+      ServiceName: !Sub '${ProjectName}'
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref TaskDefinition
+      DesiredCount: 1
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          SecurityGroups: [!Ref ECSSecurityGroup]
+          Subnets: !Ref SubnetIds
+      LoadBalancers:
+        - ContainerName: dashboard
+          ContainerPort: 8080
+          TargetGroupArn: !Ref ALBTargetGroup
+      HealthCheckGracePeriodSeconds: 120
+
+Outputs:
+  DashboardUrl:
+    Description: Dashboard URL (HTTPS with Cognito auth)
+    Value: !Sub 'https://${DomainName}'
+  DashboardUrlALB:
+    Description: Dashboard URL (ALB DNS, for testing)
+    Value: !Sub 'http://${ALB.DNSName}'
+  GlueDatabaseName:
+    Value: !Ref GlueDatabaseName
+  GlueCrawlerName:
+    Value: !Sub '${ProjectName}-crawler'
+  AthenaOutputLocation:
+    Value: !Sub 's3://${AthenaResultsBucket}/'
+  ECSClusterName:
+    Value: !Ref ECSCluster
+  ECSServiceName:
+    Value: !Sub '${ProjectName}'
+  CognitoUserPoolId:
+    Description: Cognito User Pool ID (create users here)
+    Value: !Ref CognitoUserPool
+  CognitoLoginUrl:
+    Description: Cognito hosted UI login URL
+    Value: !Sub 'https://${CognitoUserPoolDomain}.auth.${AWS::Region}.amazoncognito.com'
